@@ -2,7 +2,14 @@
 // Configuration - modify these values as needed
 var config = {
     // Debug settings
-    debug_enabled: false,  // Set to true for detailed logging
+    debug_enabled: true,  // Set to true for detailed logging
+    
+    // Logging settings
+    logging: {
+        log_setpoints: true,          // Log setpoints to InfluxDB
+        log_on_change_only: false,    // true = only when setpoints change, false = every cycle
+        log_weather_data: true        // Include weather data in logs
+    },
     
     // Time-based operating modes with different temperature thresholds
     modes: {
@@ -202,6 +209,56 @@ function main() {
     
     // No action required
     return;
+}
+
+// Helper function to create setpoint logging data
+function createSetpointLog(mode_name, thresholds, weather, hot_water_level, s2_temp, s3_temp, s4_temp) {
+    var log_data = {
+        // Core setpoints
+        mode: mode_name,
+        switch_off_temp: thresholds.switch_off_temp,
+        switch_on_temp: thresholds.switch_on_temp,
+        switch_on_s4_temp: thresholds.switch_on_s4_temp,
+        
+        // Current status
+        hot_water_level_pct: hot_water_level,
+        
+        // Weather conditions (if available)
+        cloud_cover_pct: weather ? weather.cloud_cover : null,
+        solar_irradiance: weather ? weather.irradiance : null,
+        weather_forecast: weather ? weather.forecast : null,
+        poor_weather_mode: weather ? weather.poor_solar : false,
+        
+        // Sensor readings for context
+        s2_current: s2_temp,
+        s3_current: s3_temp,
+        s4_current: s4_temp,
+        
+        // Trigger margins (how close we are to switching)
+        margin_to_switch_on: thresholds.switch_on_temp - s3_temp,  // negative = needs heating
+        margin_to_switch_off: s3_temp - thresholds.switch_off_temp, // negative = safe from switching off
+        
+        // Time context
+        hour_of_day: new Date().getHours(),
+        timestamp: Date.now()
+    };
+    
+    return log_data;
+}
+
+// Helper function to check if setpoints have changed
+function setpointsChanged(current_log) {
+    var last_log = flow.get('last_setpoint_log');
+    
+    if (!last_log) return true; // First run
+    
+    // Check if key setpoints have changed
+    return (last_log.mode !== current_log.mode ||
+            last_log.switch_off_temp !== current_log.switch_off_temp ||
+            last_log.switch_on_temp !== current_log.switch_on_temp ||
+            last_log.switch_on_s4_temp !== current_log.switch_on_s4_temp ||
+            last_log.poor_weather_mode !== current_log.poor_weather_mode);
+}
 }
 
 // Execute main function
