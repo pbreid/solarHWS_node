@@ -2,7 +2,10 @@
 // Configuration - modify these values as needed
 var config = {
     // Debug settings
-    debug_enabled: true,  // Set to true for detailed logging
+    debug_enabled: false,  // Set to true for detailed logging
+    
+    // Rate limiting
+    controller_interval_seconds: 30,  // How often to actually run the controller logic
     
     // Logging settings
     logging: {
@@ -15,42 +18,56 @@ var config = {
     modes: {
         // Early morning (5-8 AM) - Conservative heating unless weather is poor
         morning: {
-            switch_off_temp: 45,     // Lower target to rely on solar
-            switch_on_temp: 35,      // Only heat if really low
+            switch_off_temp: 42,     // Lower target to rely on solar
+            switch_on_temp: 30,      // Only heat if really low
             switch_on_s4_temp: 38,
             // Weather-based overrides
             poor_weather: {
-                switch_off_temp: 50,
-                switch_on_temp: 40,
+                switch_off_temp: 40,
+                switch_on_temp: 30,
                 switch_on_s4_temp: 42
             }
         },
         
-        // Daytime (8 AM - 4 PM) - Minimal electrical heating, rely on solar
+        // Daytime (8 AM - 10AM   & 4PM - 6PM) - Minimal electrical heating, rely on solar
         daytime: {
-            switch_off_temp: 42,     // Very conservative
-            switch_on_temp: 32,      // Emergency only
+            switch_off_temp: 35,     // Very conservative
+            switch_on_temp: 30,      // Emergency only
             switch_on_s4_temp: 35,
             // Bad weather override
             poor_weather: {
-                switch_off_temp: 48,
+                switch_off_temp: 40,
                 switch_on_temp: 38,
                 switch_on_s4_temp: 40
             }
         },
+
+        // Daytime (10AM - 4PM) - extra minimal electrical heating, rely on solar
+        midday: {
+            switch_off_temp: 32,     // Very conservative
+            switch_on_temp: 25,      // Emergency only
+            switch_on_s4_temp: 36,
+            // Bad weather override
+            poor_weather: {
+                switch_off_temp: 40,
+                switch_on_temp: 38,
+                switch_on_s4_temp: 40
+            }
+        },
+                
         
         // Evening prep (4-7 PM) - Prepare for evening usage
         evening_prep: {
-            switch_off_temp: 52,
-            switch_on_temp: 45,
-            switch_on_s4_temp: 47
+            switch_off_temp: 45,
+            switch_on_temp: 38,
+            switch_on_s4_temp: 42
         },
         
         // Evening/Night (7 PM - 5 AM) - Ensure adequate hot water
         evening_night: {
-            switch_off_temp: 55,
-            switch_on_temp: 42,
-            switch_on_s4_temp: 45
+            switch_off_temp: 40,
+            switch_on_temp: 30,
+            switch_on_s4_temp: 38
         },
         
         // Super heat mode (manual override)
@@ -62,8 +79,26 @@ var config = {
     },
 
     // Time thresholds
-    min_time_seconds: 600
+    min_time_seconds: 600,
+    
+    // Switch state change limiting (prevents rapid cycling)
+    min_switch_interval_minutes: 15  // Minimum time between state changes
 };
+
+// Rate limiting - don't run controller logic too frequently
+var now = Date.now();
+var last_run = flow.get('last_controller_run') || 0;
+var min_interval_ms = config.controller_interval_seconds * 1000;
+
+// Skip execution if called too recently
+if (now - last_run < min_interval_ms) {
+    if (config.debug_enabled) {
+        var seconds_remaining = Math.ceil((min_interval_ms - (now - last_run)) / 1000);
+        node.warn(`Rate limited: ${seconds_remaining}s remaining until next controller run`);
+    }
+    return; // Exit early, no processing
+}
+flow.set('last_controller_run', now);
 
 // Helper function to determine time-based mode
 function getTimeBasedMode() {
@@ -72,7 +107,11 @@ function getTimeBasedMode() {
     
     if (hour >= 5 && hour < 8) {
         return 'morning';
-    } else if (hour >= 8 && hour < 16) {
+    } else if (hour >= 8 && hour < 10) {
+        return 'daytime';
+    } else if (hour >= 10 && hour < 14) {
+        return 'midday';          // New ultra-conservative period
+    } else if (hour >= 14 && hour < 16) {
         return 'daytime';
     } else if (hour >= 16 && hour < 19) {
         return 'evening_prep';
@@ -89,11 +128,17 @@ function assessWeatherConditions() {
         var solar_irradiance = global.get('weather_solar_irradiance') || 0;
         var weather_forecast_hours_ahead = global.get('weather_forecast_next_6h') || 'unknown';
         
-        // Simple logic: poor conditions if clouds > 50% OR irradiance < 100 OR forecast is overcast
+        // More realistic thresholds for Brisbane conditions
+        // Poor conditions = very high clouds OR very low irradiance OR overcast forecast
         var poor_conditions = false;
         
-        if (cloud_cover > 50) poor_conditions = true;
-        if (solar_irradiance > 0 && solar_irradiance < 100) poor_conditions = true;
+        // Only consider poor if VERY cloudy (95%+) AND low irradiance
+        if (cloud_cover > 95 && solar_irradiance < 100) poor_conditions = true;
+        
+        // // OR if solar irradiance is extremely low (heavy overcast)
+        // if (solar_irradiance > 0 && solar_irradiance < 50) poor_conditions = true;
+        
+        // OR if forecast is specifically overcast
         if (weather_forecast_hours_ahead === 'overcast') poor_conditions = true;
         
         if (config.debug_enabled) {
@@ -130,6 +175,55 @@ function estimateHotWaterLevel(s2, s3, s4) {
     if (s2 > usable_temp_threshold) hot_water_percentage += 34;
     
     return hot_water_percentage;
+}
+
+// Helper function to create setpoint logging data
+function createSetpointLog(mode_name, thresholds, weather, hot_water_level, s2_temp, s3_temp, s4_temp) {
+    var log_data = {
+        // Core setpoints
+        mode: mode_name,
+        switch_off_temp: thresholds.switch_off_temp,
+        switch_on_temp: thresholds.switch_on_temp,
+        switch_on_s4_temp: thresholds.switch_on_s4_temp,
+        
+        // Current status
+        hot_water_level_pct: hot_water_level,
+        
+        // Weather conditions (if available)
+        cloud_cover_pct: weather ? weather.cloud_cover : null,
+        solar_irradiance: weather ? weather.irradiance : null,
+        weather_forecast: weather ? weather.forecast : null,
+        poor_weather_mode: weather ? weather.poor_solar : false,
+        
+        // Sensor readings for context
+        s2_current: s2_temp,
+        s3_current: s3_temp,
+        s4_current: s4_temp,
+        
+        // Trigger margins (how close we are to switching)
+        margin_to_switch_on: thresholds.switch_on_temp - s3_temp,  // negative = needs heating
+        margin_to_switch_off: s3_temp - thresholds.switch_off_temp, // negative = safe from switching off
+        
+        // Time context
+        hour_of_day: new Date().getHours(),
+        timestamp: Date.now()
+    };
+    
+    return log_data;
+}
+
+// Helper function to check if setpoints have changed
+function setpointsChanged(current_log) {
+    var last_log = flow.get('last_setpoint_log');
+    
+    if (!last_log) return true; // First run
+    
+    // Check if key setpoints have changed
+    return (last_log.mode !== current_log.mode ||
+            last_log.switch_off_temp !== current_log.switch_off_temp ||
+            last_log.switch_on_temp !== current_log.switch_on_temp ||
+            last_log.switch_on_s4_temp !== current_log.switch_on_s4_temp ||
+            last_log.poor_weather_mode !== current_log.poor_weather_mode);
 }
 
 // Main control logic
@@ -187,7 +281,20 @@ function main() {
     
     // Check for switch-off conditions
     if (hot_water_element == 1 && s3_temp > thresholds.switch_off_temp) {
+        // Check if enough time has passed since last switch
+        var last_switch_time = flow.get('last_element_switch_time') || 0;
+        var time_since_last_switch = (Date.now() - last_switch_time) / (1000 * 60); // minutes
+        
+        if (time_since_last_switch < config.min_switch_interval_minutes) {
+            if (config.debug_enabled) {
+                var wait_time = Math.ceil(config.min_switch_interval_minutes - time_since_last_switch);
+                node.warn(`Switch-off blocked: Only ${Math.floor(time_since_last_switch)}min since last switch, need ${wait_time}min more`);
+            }
+            return; // Don't switch yet
+        }
+        
         msg.payload = 0;
+        flow.set('last_element_switch_time', Date.now());
         if (config.debug_enabled) {
             node.warn(`Switching OFF: S3 temp ${s3_temp}°C > threshold ${thresholds.switch_off_temp}°C`);
         }
@@ -200,9 +307,26 @@ function main() {
         s3_temp < thresholds.switch_on_temp &&
         s4_temp < thresholds.switch_on_s4_temp) {
         
+        // Check if enough time has passed since last switch
+        var last_switch_time = flow.get('last_element_switch_time') || 0;
+        var time_since_last_switch = (Date.now() - last_switch_time) / (1000 * 60); // minutes
+        
+        if (time_since_last_switch < config.min_switch_interval_minutes) {
+            if (config.debug_enabled) {
+                var wait_time = Math.ceil(config.min_switch_interval_minutes - time_since_last_switch);
+                node.warn(`Switch-on blocked: Only ${Math.floor(time_since_last_switch)}min since last switch, need ${wait_time}min more`);
+            }
+            return; // Don't switch yet
+        }
+        
         msg.payload = 1;
+        flow.set('last_element_switch_time', Date.now());
         if (config.debug_enabled) {
             node.warn(`Switching ON: S3:${s3_temp}°C < ${thresholds.switch_on_temp}°C AND S4:${s4_temp}°C < ${thresholds.switch_on_s4_temp}°C`);
+            node.warn(`Switch-on check: s3=${s3_temp} < ${thresholds.switch_on_temp}? ${s3_temp < thresholds.switch_on_temp}`);
+            node.warn(`Switch-on check: s4=${s4_temp} < ${thresholds.switch_on_s4_temp}? ${s4_temp < thresholds.switch_on_s4_temp}`);
+            node.warn(`Switch-on check: time=${time_seconds} > ${config.min_time_seconds}? ${time_seconds > config.min_time_seconds}`);
+            node.warn(`Switch-on check: element=${hot_water_element} == 0? ${hot_water_element == 0}`);
         }
         return msg;
     }
@@ -211,55 +335,65 @@ function main() {
     return;
 }
 
-// Helper function to create setpoint logging data
-function createSetpointLog(mode_name, thresholds, weather, hot_water_level, s2_temp, s3_temp, s4_temp) {
-    var log_data = {
-        // Core setpoints
-        mode: mode_name,
-        switch_off_temp: thresholds.switch_off_temp,
-        switch_on_temp: thresholds.switch_on_temp,
-        switch_on_s4_temp: thresholds.switch_on_s4_temp,
-        
-        // Current status
-        hot_water_level_pct: hot_water_level,
-        
-        // Weather conditions (if available)
-        cloud_cover_pct: weather ? weather.cloud_cover : null,
-        solar_irradiance: weather ? weather.irradiance : null,
-        weather_forecast: weather ? weather.forecast : null,
-        poor_weather_mode: weather ? weather.poor_solar : false,
-        
-        // Sensor readings for context
-        s2_current: s2_temp,
-        s3_current: s3_temp,
-        s4_current: s4_temp,
-        
-        // Trigger margins (how close we are to switching)
-        margin_to_switch_on: thresholds.switch_on_temp - s3_temp,  // negative = needs heating
-        margin_to_switch_off: s3_temp - thresholds.switch_off_temp, // negative = safe from switching off
-        
-        // Time context
-        hour_of_day: new Date().getHours(),
-        timestamp: Date.now()
-    };
-    
-    return log_data;
-}
-
-// Helper function to check if setpoints have changed
-function setpointsChanged(current_log) {
-    var last_log = flow.get('last_setpoint_log');
-    
-    if (!last_log) return true; // First run
-    
-    // Check if key setpoints have changed
-    return (last_log.mode !== current_log.mode ||
-            last_log.switch_off_temp !== current_log.switch_off_temp ||
-            last_log.switch_on_temp !== current_log.switch_on_temp ||
-            last_log.switch_on_s4_temp !== current_log.switch_on_s4_temp ||
-            last_log.poor_weather_mode !== current_log.poor_weather_mode);
-}
-}
-
 // Execute main function
-return main();
+var main_result = main();
+
+// Create setpoint logging data if enabled
+if (config.logging.log_setpoints) {
+    if (config.debug_enabled) {
+        node.warn("Starting setpoint logging...");
+    }
+    
+    // Get global variables
+    var super_heat = global.get('super_heat') || 0;
+    
+    var mode_name = super_heat == 1 ? 'super_heat' : getTimeBasedMode();
+    var weather = assessWeatherConditions();
+    var s2_temp = msg.payload.s2;
+    var s3_temp = msg.payload.s3;
+    var s4_temp = msg.payload.s4;
+    var hot_water_level = estimateHotWaterLevel(s2_temp, s3_temp, s4_temp);
+    
+    // Determine current thresholds (copy logic from main function)
+    var current_thresholds;
+    if (super_heat == 1) {
+        current_thresholds = config.modes.super_heat;
+    } else {
+        var time_mode = getTimeBasedMode();
+        if ((time_mode === 'morning' || time_mode === 'daytime' || time_mode === 'midday') && weather.poor_solar) {
+            current_thresholds = config.modes[time_mode].poor_weather;
+        } else {
+            current_thresholds = config.modes[time_mode];
+        }
+    }
+    
+    // Create the setpoint log data
+    var setpoint_log = createSetpointLog(mode_name, current_thresholds, weather, hot_water_level, s2_temp, s3_temp, s4_temp);
+    
+    // Check if we should log (based on change-only setting)
+    var should_log = true;
+    if (config.logging.log_on_change_only) {
+        should_log = setpointsChanged(setpoint_log);
+        if (should_log) {
+            flow.set('last_setpoint_log', setpoint_log);
+        }
+    }
+    
+    // Send setpoint data to second output if we should log
+    if (should_log) {
+        var setpoint_msg = {
+            payload: setpoint_log,
+            topic: "solarHW_setpoints"
+        };
+        
+        if (config.debug_enabled) {
+            node.warn(`Logging setpoints: mode=${mode_name}, switch_on=${current_thresholds.switch_on_temp}°C, switch_off=${current_thresholds.switch_off_temp}°C`);
+        }
+        
+        // Return array: [main output, setpoint logging output]
+        return [main_result, setpoint_msg];
+    }
+}
+
+// Return just the main result if no logging
+return [main_result, null];
